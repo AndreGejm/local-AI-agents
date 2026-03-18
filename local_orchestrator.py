@@ -69,10 +69,38 @@ class OrchestratorResponse:
 # Worker adapter — calls server.py functions directly
 # ---------------------------------------------------------------------------
 
+# Explicit allowlist of callable tool names in server.py.
+# Any string NOT in this set is rejected before getattr is ever called.
+# This prevents an upstream payload from resolving to an arbitrary internal function.
+_ALLOWED_TOOLS: frozenset = frozenset({
+    "read_file",
+    "list_files",
+    "grep_code",
+    "extract_function",
+    "extract_patch_block",
+    "apply_unified_diff",
+    "restore_files",
+    "run_py_compile",
+    "run_lint",
+    "run_pytest",
+    "triage_issue",
+    "review_code",
+    "draft_patch",
+    "propose_fix",
+    "generate_tests",
+    "summarize_diff",
+})
+
+
 class MCPWorkerAdapter:
-    """Resolves tool names to server.py async functions via getattr."""
+    """Resolves tool names to server.py async functions via explicit allowlist + getattr."""
 
     async def call_tool(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        if tool_name not in _ALLOWED_TOOLS:
+            return {
+                "success": False,
+                "stderr": f"Tool '{tool_name}' is not in the allowed tool surface.",
+            }
         fn = getattr(server, tool_name, None)
         if fn is None or not callable(fn):
             return {"success": False, "stderr": f"Tool '{tool_name}' not found in server module."}

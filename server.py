@@ -8,7 +8,10 @@ single FastMCP instance.
 Safety rules:
 - read_file / list_files / write_file require allowed_root when called directly.
 - apply_unified_diff runs a multi-step safety gate before touching any file.
-- run_py_compile / run_lint / run_pytest gracefully skip when tools are absent.
+- run_py_compile / run_lint / run_pytest accept cwd so they run against the
+  correct repo root rather than the process working directory.
+- propose_fix returns a structured dict with 'patch_output' and
+  'decision_output' so the controller can extract the right artifact.
 """
 from __future__ import annotations
 
@@ -111,7 +114,6 @@ async def apply_unified_diff(
 ) -> Dict[str, Any]:
     """
     Apply a unified diff to a git repository with a hard safety gate.
-    Returns a dict suitable for _normalize_command_result.
 
     Gate steps (in order):
     1  Canonicalize root; verify .git exists
@@ -202,13 +204,21 @@ async def apply_unified_diff(
 
     try:
         # Dry-run
-        dry = await file_ops._run_subprocess(["git", "apply", "--check", patch_file], cwd=str(repo_root))
+        dry = await file_ops._run_subprocess(
+            ["git", "apply", "--check", patch_file],
+            cwd=str(repo_root),
+            timeout_sec=config.DEFAULT_TIMEOUT_SEC,
+        )
         if not dry.success:
             return {"success": False, "exit_code": dry.exit_code,
                     "stdout": dry.stdout, "stderr": f"Dry-run failed: {dry.stderr}"}
 
         # Apply
-        result = await file_ops._run_subprocess(["git", "apply", patch_file], cwd=str(repo_root))
+        result = await file_ops._run_subprocess(
+            ["git", "apply", patch_file],
+            cwd=str(repo_root),
+            timeout_sec=config.DEFAULT_TIMEOUT_SEC,
+        )
         if not result.success:
             file_ops.rollback_files(snapshot, repo_root)
             return {"success": False, "exit_code": result.exit_code,
@@ -220,6 +230,9 @@ async def apply_unified_diff(
             "stdout": result.stdout,
             "stderr": "",
             "changed_files": changed_files,
+            # Expose the snapshot so the caller can do snapshot-based rollback
+            # if post-apply validation later fails (instead of git checkout HEAD).
+            "snapshot": snapshot,
         }
     finally:
         try:
@@ -229,11 +242,17 @@ async def apply_unified_diff(
 
 
 # ---------------------------------------------------------------------------
-# Workspace restore (called by escalation_controller repair loop rollback)
+# Workspace restore (git-based — used only by explicit user request, NOT by the repair loop)
 # ---------------------------------------------------------------------------
 
 async def restore_files(paths: List[str], root: str) -> Dict[str, Any]:
-    """Restore named files to their last committed state using git checkout."""
+    """
+    Restore named files to their last committed state using git checkout.
+    NOTE: This is intentionally NOT called by the controller retry loop.
+    The retry loop uses snapshot-based rollback (file_ops.rollback_files)
+    to avoid destroying uncommitted edits in a dirty worktree.
+    This function remains for explicit user-initiated resets only.
+    """
     if not paths:
         return {"success": True, "exit_code": 0, "stdout": "Nothing to restore.", "stderr": ""}
     repo_root = Path(root).resolve()
@@ -243,45 +262,48 @@ async def restore_files(paths: List[str], root: str) -> Dict[str, Any]:
     result = await file_ops._run_subprocess(
         ["git", "checkout", "HEAD", "--"] + paths,
         cwd=str(repo_root),
+        timeout_sec=config.DEFAULT_TIMEOUT_SEC,
     )
     return {"success": result.success, "exit_code": result.exit_code,
             "stdout": result.stdout, "stderr": result.stderr}
 
 
 # ---------------------------------------------------------------------------
-# Deterministic validation tools
+# Deterministic validation tools — all accept cwd to pin to the repo root
 # ---------------------------------------------------------------------------
 
-async def run_py_compile(paths: str) -> Dict[str, Any]:
+async def run_py_compile(paths: str, cwd: Optional[str] = None) -> Dict[str, Any]:
     """Syntax-check one or more Python files via py_compile / compileall."""
     target = paths.strip()
     if target.endswith(os.sep) or Path(target).is_dir():
         cmd = [sys.executable, "-m", "compileall", "-q", target]
     else:
         cmd = [sys.executable, "-m", "py_compile", target]
-    result = await file_ops._run_subprocess(cmd)
+    result = await file_ops._run_subprocess(cmd, cwd=cwd, timeout_sec=config.DEFAULT_TIMEOUT_SEC)
     return {"success": result.success, "exit_code": result.exit_code,
             "stdout": result.stdout, "stderr": result.stderr}
 
 
-async def run_lint(paths: str) -> Dict[str, Any]:
+async def run_lint(paths: str, cwd: Optional[str] = None) -> Dict[str, Any]:
     """Run ruff (preferred) or flake8 on paths. Skips gracefully if neither is installed."""
     linter = shutil.which("ruff") or shutil.which("flake8")
     if not linter:
         return {"success": True, "exit_code": 0, "stdout": "",
                 "stderr": "[lint skipped — ruff/flake8 not found]"}
-    result = await file_ops._run_subprocess([linter, paths])
+    result = await file_ops._run_subprocess([linter, paths], cwd=cwd, timeout_sec=config.DEFAULT_TIMEOUT_SEC)
     return {"success": result.success, "exit_code": result.exit_code,
             "stdout": result.stdout, "stderr": result.stderr}
 
 
-async def run_pytest(paths: str) -> Dict[str, Any]:
+async def run_pytest(paths: str, cwd: Optional[str] = None) -> Dict[str, Any]:
     """Run pytest on a target path. Skips gracefully if pytest is not installed."""
     if not shutil.which("pytest"):
         return {"success": True, "exit_code": 0, "stdout": "",
                 "stderr": "[pytest skipped — not found]"}
     result = await file_ops._run_subprocess(
-        [sys.executable, "-m", "pytest", paths, "-x", "-q", "--tb=short"]
+        [sys.executable, "-m", "pytest", paths, "-x", "-q", "--tb=short"],
+        cwd=cwd,
+        timeout_sec=config.DEFAULT_TIMEOUT_SEC,
     )
     return {"success": result.success, "exit_code": result.exit_code,
             "stdout": result.stdout, "stderr": result.stderr}
@@ -289,7 +311,6 @@ async def run_pytest(paths: str) -> Dict[str, Any]:
 
 # ---------------------------------------------------------------------------
 # LLM pipeline functions (delegate to llm_orchestrator)
-# Called by escalation_controller via MCPWorkerAdapter
 # ---------------------------------------------------------------------------
 
 async def triage_issue(task: str, context: str = "", strict: bool = True) -> str:
@@ -309,9 +330,22 @@ async def draft_patch(task: str, context: str = "", strict: bool = True) -> str:
 
 
 async def propose_fix(task: str, context: str = "", strict: bool = True) -> str:
+    """
+    Run the full fix pipeline and return a structured result dict.
+    'patch_output': the actual diff artifact from the fix_patch phase.
+    'decision_output': the final prose decision from fix_final_decision.
+    The controller must consume 'patch_output', not 'output', to get the patch.
+    """
     phases = ["fix_pre_review", "fix_patch", "fix_post_review", "fix_test_plan", "fix_final_decision"]
     res = await llm_orchestrator.run_pipeline("fix", task, context, phases, strict=strict)
-    return json.dumps({"success": res.success, "output": res.final_output}, indent=2)
+    patch_output = res.get_phase_output("fix_patch") or ""
+    decision_output = res.get_phase_output("fix_final_decision") or res.final_output
+    return json.dumps({
+        "success": res.success,
+        "patch_output": patch_output,
+        "decision_output": decision_output,
+        "output": patch_output,   # backward-compat key: controller extract uses this
+    }, indent=2)
 
 
 async def generate_tests(task: str, context: str = "", strict: bool = True) -> str:

@@ -12,10 +12,15 @@ import re
 import ast
 import asyncio
 import fnmatch
+import logging
 import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Sequence
 from dataclasses import dataclass
+
+# Maximum per-file byte size to snapshot without a warning.
+# Larger files are still snapshotted — this only logs a warning.
+_SNAPSHOT_WARN_BYTES = 10 * 1024 * 1024  # 10 MB
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +37,17 @@ class CommandResult:
     duration_sec: float
 
 
-async def _run_subprocess(command: Sequence[str], cwd: Optional[str] = None) -> CommandResult:
+async def _run_subprocess(
+    command: Sequence[str],
+    cwd: Optional[str] = None,
+    timeout_sec: float = 120.0,
+) -> CommandResult:
+    """
+    Run a subprocess and capture output.
+    Enforces a hard timeout to prevent deadlocks from hanging tools.
+    If the timeout expires, the process is killed and a failing CommandResult
+    is returned — the caller never hangs.
+    """
     start_t = time.monotonic()
     cmd = [str(x) for x in command]
     try:
@@ -42,7 +57,25 @@ async def _run_subprocess(command: Sequence[str], cwd: Optional[str] = None) -> 
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout_bytes, stderr_bytes = await proc.communicate()
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=timeout_sec,
+            )
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return CommandResult(
+                success=False,
+                exit_code=-1,
+                stdout="",
+                stderr=f"[TIMEOUT] Command exceeded {timeout_sec}s limit: {' '.join(cmd)}",
+                command=" ".join(cmd),
+                duration_sec=time.monotonic() - start_t,
+            )
+
         duration = time.monotonic() - start_t
         return CommandResult(
             success=(proc.returncode == 0),
@@ -183,11 +216,22 @@ def snapshot_files(paths: List[str], repo_root: Path) -> Dict[str, Optional[byte
     """
     Capture current file bytes for rollback.
     Files that do not exist are stored as None so rollback knows to delete them.
+    Emits a warning (not an error) for files larger than _SNAPSHOT_WARN_BYTES
+    so operators are alerted to unexpectedly large snapshot operations.
     """
     snapshot: Dict[str, Optional[bytes]] = {}
     for rel in paths:
         full = repo_root / rel
-        snapshot[rel] = full.read_bytes() if full.exists() else None
+        if full.exists():
+            size = full.stat().st_size
+            if size > _SNAPSHOT_WARN_BYTES:
+                logging.warning(
+                    f"snapshot_files: '{rel}' is {size // (1024*1024)} MB — "
+                    f"proceeding but this is an unusually large file for local patching."
+                )
+            snapshot[rel] = full.read_bytes()
+        else:
+            snapshot[rel] = None
     return snapshot
 
 
@@ -195,6 +239,7 @@ def rollback_files(snapshot: Dict[str, Optional[bytes]], repo_root: Path) -> Non
     """
     Restore files to their pre-apply state from a snapshot.
     None entries (files that did not exist) are deleted if they were created.
+    Raises on any filesystem error so callers can treat rollback failure as fatal.
     """
     for rel, original in snapshot.items():
         full = repo_root / rel

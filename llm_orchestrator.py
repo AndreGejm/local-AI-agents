@@ -12,8 +12,8 @@ from __future__ import annotations
 import re
 import time
 import json
-from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence
 
 from config import (
     PHASE_DEFINITIONS,
@@ -36,13 +36,26 @@ class PhaseResult:
     raw_output: Optional[str] = None
 
 
-@dataclass(frozen=True)
+@dataclass
 class PipelineResult:
+    """
+    Result of a multi-phase pipeline run.
+
+    phase_map provides named access to individual phase outputs so callers
+    can extract the artifact from a specific phase (e.g. "fix_patch") rather
+    than only having access to the final decision text.
+    """
     success: bool
     final_state: str
     final_output: str
     duration_sec: float
     phase_results: Sequence[PhaseResult]
+    phase_map: Dict[str, PhaseResult] = field(default_factory=dict)
+
+    def get_phase_output(self, name: str) -> Optional[str]:
+        """Return the output string of a named phase, or None if not run."""
+        result = self.phase_map.get(name)
+        return result.output if result else None
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +156,7 @@ async def run_phase(
     phase_name: str,
     task_description: str,
     base_context: Optional[str] = None,
-    prior_phase_results: Optional[List[PhaseResult]] = None,  # never use [] as default
+    prior_phase_results: Optional[List[PhaseResult]] = None,
     strict: bool = True,
     timeout_sec: int = DEFAULT_TIMEOUT_SEC,
 ) -> PhaseResult:
@@ -219,6 +232,7 @@ async def run_pipeline(
 
     success = all(r.success for r in phase_results)
     final_output = phase_results[-1].output if phase_results else "No phases run."
+    phase_map = {r.phase_name: r for r in phase_results}
 
     return PipelineResult(
         success=success,
@@ -226,4 +240,5 @@ async def run_pipeline(
         final_output=final_output,
         duration_sec=time.monotonic() - start,
         phase_results=phase_results,
+        phase_map=phase_map,
     )

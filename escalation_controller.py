@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Protocol, Sequence
 
 import config
+import utils.file_ops as file_ops
 
 
 Status = Literal["success", "fail", "escalate"]
@@ -36,6 +37,10 @@ _MUTATING_TASKS: frozenset = frozenset({"draft_patch", "propose_fix"})
 _READ_ONLY_TASKS: frozenset = frozenset({"triage", "review", "generate_tests", "summarize_diff"})
 _COMPLEXITY_THRESHOLD_MUTATING: int = 12
 _COMPLEXITY_THRESHOLD_READONLY: int = 20
+
+
+class RollbackError(RuntimeError):
+    """Raised when a rollback attempt fails — workspace state is indeterminate."""
 
 
 class WorkerClient(Protocol):
@@ -144,20 +149,31 @@ class EscalationController:
             )
 
         # ---------------------------------------------------------------
-        # Mutating tasks: patch-apply loop with mandatory rollback.
-        # Non-negotiable constraint B: any retry starts from clean state.
+        # Mutating tasks: patch-apply loop with mandatory snapshot rollback.
+        # Non-negotiable constraint: any retry starts from exact pre-attempt bytes.
         # ---------------------------------------------------------------
         if req.task_type in _MUTATING_TASKS:
             attempts = 0
             validations: List[ValidationResult] = []
-            # Files changed by the most recent successful apply (for rollback).
+            # Snapshot taken from apply_unified_diff result so we can restore
+            # exact bytes rather than git checkout HEAD (which destroys dirty-tree edits).
+            apply_snapshot: Optional[Dict[str, Optional[bytes]]] = None
             applied_files: Optional[List[str]] = None
 
             while attempts <= self.config.max_local_repair_attempts:
-                # Roll back workspace to clean state before every attempt
-                # (including the first, which is a no-op since applied_files is None).
-                if applied_files is not None:
-                    await self._rollback_workspace(applied_files)
+                # Roll back workspace to exact pre-attempt bytes before every attempt.
+                # On the first iteration applied_files is None — this is a no-op.
+                if apply_snapshot is not None and applied_files is not None:
+                    try:
+                        await self._rollback_from_snapshot(apply_snapshot, applied_files)
+                    except Exception as rb_exc:
+                        return ControllerResult(
+                            status="escalate",
+                            reason=f"CRITICAL: rollback failed — workspace may be dirty. {rb_exc}",
+                            tool_used=decision.tool_name,
+                            attempts=attempts,
+                        )
+                    apply_snapshot = None
                     applied_files = None
 
                 attempts += 1
@@ -183,17 +199,25 @@ class EscalationController:
                         attempts=attempts,
                     )
 
-                # Extract patch text from model output.
+                # Extract patch text.
+                # propose_fix returns {"patch_output": "...", "output": "..."}
+                # draft_patch / other tools return {"output": "..."}.
+                # The controller always looks at "patch_output" first, then "output".
                 patch_text: Optional[str] = None
-                try:
-                    ext_raw = await self.worker.call_tool(
-                        "extract_patch_block",
-                        {"text": parsed.get("output", "")},
-                    )
-                    if isinstance(ext_raw, dict):
-                        patch_text = ext_raw.get("patch_text") or None
-                except Exception:
-                    patch_text = None
+                raw_result = parsed.get("raw", {})
+                if isinstance(raw_result, dict):
+                    patch_text = raw_result.get("patch_output") or None
+
+                if not patch_text:
+                    try:
+                        ext_raw = await self.worker.call_tool(
+                            "extract_patch_block",
+                            {"text": parsed.get("output", "")},
+                        )
+                        if isinstance(ext_raw, dict):
+                            patch_text = ext_raw.get("patch_text") or None
+                    except Exception:
+                        patch_text = None
 
                 if not patch_text:
                     patch_text = self._extract_patch_or_code(parsed.get("output", ""))
@@ -216,7 +240,21 @@ class EscalationController:
                         attempts=attempts,
                     )
 
-                apply_result = await self._apply_patch_if_possible(patch_text)
+                # Build declared_files scope from file_path (if given) to
+                # activate the gate's anti-drift control (defect C).
+                declared_files: Optional[List[str]] = None
+                if req.file_path and self.config.allowed_patch_root:
+                    try:
+                        rel = str(
+                            Path(req.file_path).resolve().relative_to(
+                                Path(self.config.allowed_patch_root).resolve()
+                            )
+                        ).replace("\\", "/")
+                        declared_files = [rel]
+                    except ValueError:
+                        declared_files = None
+
+                apply_result = await self._apply_patch_if_possible(patch_text, declared_files)
                 validations.append(apply_result)
 
                 if not apply_result.success:
@@ -229,9 +267,11 @@ class EscalationController:
                         attempts=attempts,
                     )
 
-                # Record changed files so we can roll back if validation fails.
+                # Capture the snapshot returned by the gate for byte-exact rollback.
+                apply_snapshot = apply_result.metadata.get("snapshot")
                 applied_files = apply_result.metadata.get("changed_files", [])
 
+                # Run post-apply validation pinned to the repo root (defect D).
                 post_validations = await self._run_post_patch_validations(req)
                 validations.extend(post_validations)
 
@@ -250,9 +290,17 @@ class EscalationController:
                     )
 
                 if attempts > self.config.max_local_repair_attempts:
-                    # Rollback before escalating — workspace must be clean.
-                    if applied_files:
-                        await self._rollback_workspace(applied_files)
+                    # Rollback before escalating — workspace must be exact pre-attempt state.
+                    if apply_snapshot and applied_files:
+                        try:
+                            await self._rollback_from_snapshot(apply_snapshot, applied_files)
+                        except Exception as rb_exc:
+                            return ControllerResult(
+                                status="escalate",
+                                reason=f"CRITICAL: rollback failed before escalation — workspace may be dirty. {rb_exc}",
+                                tool_used=decision.tool_name,
+                                attempts=attempts,
+                            )
                     return ControllerResult(
                         status="escalate",
                         reason="Deterministic validation failed after local repair attempts.",
@@ -263,13 +311,20 @@ class EscalationController:
                     )
 
                 # Inject failure bundle for the next attempt.
-                # Rollback happens at the top of the next iteration.
                 failure_bundle = self._build_failure_bundle(req, failed_validations)
                 local_args["context"] = self._merge_contexts(local_args["context"], failure_bundle)
 
-            # Should never reach here, but be safe.
-            if applied_files:
-                await self._rollback_workspace(applied_files)
+            # Safety net: should not reach here, but rollback + escalate.
+            if apply_snapshot and applied_files:
+                try:
+                    await self._rollback_from_snapshot(apply_snapshot, applied_files)
+                except Exception as rb_exc:
+                    return ControllerResult(
+                        status="escalate",
+                        reason=f"CRITICAL: rollback failed at loop exit — workspace may be dirty. {rb_exc}",
+                        tool_used=decision.tool_name,
+                        attempts=attempts,
+                    )
             return ControllerResult(
                 status="escalate",
                 reason="Exceeded local repair attempts.",
@@ -289,12 +344,12 @@ class EscalationController:
 
     async def _preflight_decide(self, req: TaskRequest) -> EscalationDecision:
         tool_map: Dict[str, str] = {
-            "triage":        "triage_issue",
-            "review":        "review_code",
-            "draft_patch":   "draft_patch",
-            "generate_tests":"generate_tests",
-            "summarize_diff":"summarize_diff",
-            "propose_fix":   "propose_fix",
+            "triage":         "triage_issue",
+            "review":         "review_code",
+            "draft_patch":    "draft_patch",
+            "generate_tests": "generate_tests",
+            "summarize_diff": "summarize_diff",
+            "propose_fix":    "propose_fix",
         }
 
         complexity = 0
@@ -400,8 +455,6 @@ class EscalationController:
             complexity += line_count // 100
             complexity += function_count // 4
 
-        # Task-type complexity bumps — mutating tasks and review get the same bump,
-        # but their threshold is lower (12 vs 20), so they escalate sooner.
         if req.task_type in ("propose_fix", "review", "draft_patch"):
             complexity += 10
         elif req.task_type == "triage":
@@ -416,7 +469,6 @@ class EscalationController:
             complexity += 5
             metadata["concurrency_detected"] = True
 
-        # Apply threshold based on operation risk tier.
         threshold = (
             _COMPLEXITY_THRESHOLD_MUTATING
             if req.task_type in _MUTATING_TASKS
@@ -455,7 +507,11 @@ class EscalationController:
         except Exception:
             return None
 
-    async def _apply_patch_if_possible(self, patch_text: str) -> ValidationResult:
+    async def _apply_patch_if_possible(
+        self,
+        patch_text: str,
+        declared_files: Optional[List[str]] = None,
+    ) -> ValidationResult:
         if not self.config.allowed_patch_root:
             return ValidationResult(
                 success=False,
@@ -466,13 +522,13 @@ class EscalationController:
                 ),
             )
         try:
-            result = await self.worker.call_tool(
-                "apply_unified_diff",
-                {
-                    "patch_text": patch_text,
-                    "root": self.config.allowed_patch_root,
-                },
-            )
+            args: Dict[str, Any] = {
+                "patch_text": patch_text,
+                "root": self.config.allowed_patch_root,
+            }
+            if declared_files:
+                args["declared_files"] = declared_files
+            result = await self.worker.call_tool("apply_unified_diff", args)
             return self._normalize_command_result("apply_patch", result)
         except Exception as exc:
             return ValidationResult(
@@ -481,34 +537,50 @@ class EscalationController:
                 stderr=str(exc),
             )
 
-    async def _rollback_workspace(self, changed_files: List[str]) -> None:
+    async def _rollback_from_snapshot(
+        self,
+        snapshot: Dict[str, Optional[bytes]],
+        changed_files: List[str],
+    ) -> None:
         """
-        Best-effort rollback to clean git state.
-        Called before every retry attempt and before escalating after validation failure.
+        Byte-exact rollback using the snapshot captured before apply.
+        Raises RollbackError if any file cannot be restored — this is treated
+        as a fatal condition and forces escalation with a CRITICAL reason.
+        Does NOT use git checkout HEAD (which would destroy uncommitted edits).
         """
-        if not self.config.allowed_patch_root or not changed_files:
+        if not self.config.allowed_patch_root or not changed_files or not snapshot:
             return
-        try:
-            await self.worker.call_tool(
-                "restore_files",
-                {"paths": changed_files, "root": self.config.allowed_patch_root},
-            )
-        except Exception as exc:
-            logging.warning(f"Rollback attempt failed: {exc}")
+        repo_root = Path(self.config.allowed_patch_root)
+        # Raises on filesystem errors — caller catches and converts to escalate.
+        file_ops.rollback_files(snapshot, repo_root)
 
     async def _run_post_patch_validations(self, req: TaskRequest) -> List[ValidationResult]:
+        """
+        Run compile, lint, and pytest checks on the patched workspace.
+        All subprocesses are pinned to allowed_patch_root (defect D fix).
+        """
         results: List[ValidationResult] = []
+        cwd = self.config.allowed_patch_root  # pin to repo root
         compile_target = req.file_path or "."
         results.append(
-            await self._safe_tool_command("py_compile", "run_py_compile", {"paths": compile_target})
+            await self._safe_tool_command(
+                "py_compile", "run_py_compile",
+                {"paths": compile_target, "cwd": cwd},
+            )
         )
         if req.lint_target:
             results.append(
-                await self._safe_tool_command("lint", "run_lint", {"paths": req.lint_target})
+                await self._safe_tool_command(
+                    "lint", "run_lint",
+                    {"paths": req.lint_target, "cwd": cwd},
+                )
             )
         if req.pytest_target:
             results.append(
-                await self._safe_tool_command("pytest", "run_pytest", {"paths": req.pytest_target})
+                await self._safe_tool_command(
+                    "pytest", "run_pytest",
+                    {"paths": req.pytest_target, "cwd": cwd},
+                )
             )
         return results
 
@@ -561,7 +633,8 @@ class EscalationController:
 
     def _extract_text_field(self, raw: Dict[str, Any]) -> str:
         if isinstance(raw, dict):
-            for key in ("text", "output", "content", "result", "source", "patch_text"):
+            # Prefer patch_output for mutating responses (defect A fix)
+            for key in ("patch_output", "text", "output", "content", "result", "source", "patch_text"):
                 value = raw.get(key)
                 if isinstance(value, str):
                     return value
@@ -578,7 +651,7 @@ class EscalationController:
         if code_match:
             return code_match.group(1).strip()
 
-        # Structured section (terminated by next numbered heading or end of string).
+        # Structured section.
         section_match = re.search(
             r"5\.\s*Code(?: block)?\s*\n(.*?)(?=\n\d+\.\s|\Z)",
             output,
